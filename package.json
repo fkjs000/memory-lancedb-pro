@@ -1,7 +1,7 @@
 {
   "name": "memory-lancedb-pro",
-  "version": "1.0.23",
-  "description": "OpenClaw enhanced LanceDB memory plugin with hybrid retrieval (Vector + BM25), cross-encoder rerank, multi-scope isolation, long-context chunking, and management CLI",
+  "version": "2026.3.03",
+  "description": "OpenClaw enhanced LanceDB memory plugin with Stability Optimization (Timeout & Proactive Chunking)",
   "type": "module",
   "main": "index.ts",
   "keywords": [
@@ -16,13 +16,14 @@
     "ai-memory",
     "long-term-memory",
     "chunking",
-    "long-context"
+    "long-context",
+    "stability-fix"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/win4r/memory-lancedb-pro.git"
+    "url": "git+https://github.com/fkjs000/memory-lancedb-pro.git"
   },
-  "author": "win4r",
+  "author": "fkjs000",
   "license": "MIT",
   "dependencies": {
     "@lancedb/lancedb": "^0.26.2",

@@ -48,6 +48,18 @@ The built-in `memory-lancedb` plugin in OpenClaw provides basic vector search. *
 | Management CLI | ❌ | ✅ |
 | Session memory | ❌ | ✅ |
 | Task-aware embeddings | ❌ | ✅ |
+| **Proactive Chunking** | ❌ | ✅ |
+| **Stability Timeout (120s)** | ❌ | ✅ |
+
+---
+
+## 🚀 Stability Optimization (v2026.3.03)
+
+This version introduces critical fixes for large-scale memory indexing:
+- **Proactive Chunking**: Automatically splits documents exceeding 8,000 characters before calling the embedding provider, preventing massive request hangs.
+- **Safety Timeout**: Hardcoded 120s timeout for OpenAI-compatible clients to prevent OpenClaw's Health-Monitor from triggering a system-wide restart (the 10-minute lockup issue).
+- **Averaged Embeddings**: Long documents are embedded as semantic chunks and then vector-averaged for representative retrieval.
+
 | Any OpenAI-compatible embedding | Limited | ✅ (OpenAI, Gemini, Jina, Ollama, etc.) |
 
 ---

@@ -180,6 +180,7 @@ export class Embedder {
     this.client = new OpenAI({
       apiKey: resolvedApiKey,
       ...(config.baseURL ? { baseURL: config.baseURL } : {}),
+      timeout: 120000, // 2 minutes timeout to prevent health-monitor lockup
     });
 
     this.dimensions = getVectorDimensions(config.model, config.dimensions);
@@ -270,6 +271,13 @@ export class Embedder {
     const cached = this._cache.get(text, task);
     if (cached) return cached;
 
+    // Proactive chunking: if text is very long, don't even try single request
+    const PROACTIVE_CHUNK_THRESHOLD = 8000;
+    if (this._autoChunk && text.length > PROACTIVE_CHUNK_THRESHOLD) {
+      console.log(`Text length (${text.length}) exceeds proactive threshold, chunking...`);
+      return this.performChunkedEmbedding(text, task, "Proactive threshold exceeded");
+    }
+
     try {
       const response = await this.client.embeddings.create(this.buildPayload(text, task) as any);
       const embedding = response.data[0]?.embedding as number[] | undefined;
@@ -286,57 +294,66 @@ export class Embedder {
       const isContextError = /context|too long|exceed|length/i.test(errorMsg);
 
       if (isContextError && this._autoChunk) {
-        try {
-          console.log(`Document exceeded context limit (${errorMsg}), attempting chunking...`);
-          const chunkResult = smartChunk(text, this._model);
-          
-          if (chunkResult.chunks.length === 0) {
-            throw new Error(`Failed to chunk document: ${errorMsg}`);
-          }
-
-          // Embed all chunks in parallel
-          console.log(`Split document into ${chunkResult.chunkCount} chunks for embedding`);
-          const chunkEmbeddings = await Promise.all(
-            chunkResult.chunks.map(async (chunk, idx) => {
-              try {
-                const embedding = await this.embedSingle(chunk, task);
-                return { embedding };
-              } catch (chunkError) {
-                console.warn(`Failed to embed chunk ${idx}:`, chunkError);
-                throw chunkError;
-              }
-            })
-          );
-
-          // Compute average embedding across chunks
-          const avgEmbedding = chunkEmbeddings.reduce(
-            (sum, { embedding }) => {
-              for (let i = 0; i < embedding.length; i++) {
-                sum[i] += embedding[i];
-              }
-              return sum;
-            },
-            new Array(this.dimensions).fill(0)
-          );
-
-          const finalEmbedding = avgEmbedding.map(v => v / chunkEmbeddings.length);
-          
-          // Cache the result for the original text (using its hash)
-          this._cache.set(text, task, finalEmbedding);
-          console.log(`Successfully embedded long document as ${chunkEmbeddings.length} averaged chunks`);
-          
-          return finalEmbedding;
-        } catch (chunkError) {
-          // If chunking fails, throw the original error
-          console.warn(`Chunking failed, using original error:`, chunkError);
-          throw new Error(`Failed to generate embedding: ${errorMsg}`, { cause: error });
-        }
+        return this.performChunkedEmbedding(text, task, errorMsg);
       }
 
       if (error instanceof Error) {
         throw new Error(`Failed to generate embedding: ${error.message}`, { cause: error });
       }
       throw new Error(`Failed to generate embedding: ${String(error)}`);
+    }
+  }
+
+  /** Internal helper to perform chunked embedding and averaging */
+  private async performChunkedEmbedding(text: string, task: string | undefined, reason: string): Promise<number[]> {
+    try {
+      console.log(`Attempting chunking... (Reason: ${reason})`);
+      const chunkResult = smartChunk(text, this._model);
+      
+      if (chunkResult.chunks.length === 0) {
+        throw new Error(`Failed to chunk document: ${reason}`);
+      }
+
+      // Embed all chunks in parallel
+      console.log(`Split document into ${chunkResult.chunkCount} chunks for embedding`);
+      const chunkEmbeddings = await Promise.all(
+        chunkResult.chunks.map(async (chunk, idx) => {
+          try {
+            // Note: avoid recursive proactive check by calling buildPayload directly or 
+            // a simpler internal method if needed, but here we reuse embedSingle 
+            // because chunks are guaranteed to be small.
+            const response = await this.client.embeddings.create(this.buildPayload(chunk, task) as any);
+            const embedding = response.data[0]?.embedding as number[] | undefined;
+            if (!embedding) throw new Error("No embedding in chunk response");
+            return { embedding };
+          } catch (chunkError) {
+            console.warn(`Failed to embed chunk ${idx}:`, chunkError);
+            throw chunkError;
+          }
+        })
+      );
+
+      // Compute average embedding across chunks
+      const avgEmbedding = chunkEmbeddings.reduce(
+        (sum, { embedding }) => {
+          for (let i = 0; i < embedding.length; i++) {
+            sum[i] += embedding[i];
+          }
+          return sum;
+        },
+        new Array(this.dimensions).fill(0)
+      );
+
+      const finalEmbedding = avgEmbedding.map(v => v / chunkEmbeddings.length);
+      
+      // Cache the result for the original text (using its hash)
+      this._cache.set(text, task, finalEmbedding);
+      console.log(`Successfully embedded long document as ${chunkEmbeddings.length} averaged chunks`);
+      
+      return finalEmbedding;
+    } catch (chunkError) {
+      console.warn(`Chunking process failed:`, chunkError);
+      throw new Error(`Failed to generate chunked embedding: ${reason}`, { cause: chunkError });
     }
   }
 
