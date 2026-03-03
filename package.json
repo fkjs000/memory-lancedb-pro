@@ -1,6 +1,6 @@
 {
   "name": "memory-lancedb-pro",
-  "version": "2026.3.03",
+  "version": "2026.3.03-p1",
   "description": "OpenClaw enhanced LanceDB memory plugin with Stability Optimization (Timeout & Proactive Chunking)",
   "type": "module",
   "main": "index.ts",

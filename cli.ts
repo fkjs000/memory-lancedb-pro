@@ -212,7 +212,23 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           });
         }
       } catch (error) {
-        console.error("Failed to get statistics:", error);
+        console.error(\"Failed to get statistics:\", error);
+        process.exit(1);
+      }
+    });
+
+  // Optimize memory
+  memory
+    .command(\"optimize\")
+    .description(\"Optimize memory storage (compaction and cleanup)\")
+    .action(async () => {
+      try {
+        console.log(\"Starting memory optimization...\");
+        const result = await context.store.optimize();
+        console.log(\"Memory optimization completed successfully.\");
+        console.log(`• Rows processed: ${result.beforeCount}`);
+      } catch (error) {
+        console.error(\"Optimization failed:\", error);
         process.exit(1);
       }
     });
