@@ -7,61 +7,201 @@ import { randomUUID } from "node:crypto";
 import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync } from "node:fs";
 import { dirname } from "node:path";
 
-// ============================================================================\n// Types\n// ============================================================================\n\nexport interface MemoryEntry {\n  id: string;\n  text: string;\n  vector: number[];\n  category: \"preference\" | \"fact\" | \"decision\" | \"entity\" | \"other\";\n  scope: string;\n  importance: number;\n  timestamp: number;\n  metadata?: string; // JSON string for extensible metadata\n}\n\nexport interface MemorySearchResult {\n  entry: MemoryEntry;\n  score: number;\n}\n\nexport interface StoreConfig {\n  dbPath: string;\n  vectorDim: number;\n}\n\n// ============================================================================\n// LanceDB Dynamic Import\n// ============================================================================\n\nlet lancedbImportPromise: Promise<typeof import(\"@lancedb/lancedb\")> | null = null;\n\nexport const loadLanceDB = async (): Promise<typeof import(\"@lancedb/lancedb\")> => {\n  if (!lancedbImportPromise) {\n    lancedbImportPromise = import(\"@lancedb/lancedb\");\n  }\n  try {\n    return await lancedbImportPromise;\n  } catch (err) {\n    throw new Error(`memory-lancedb-pro: failed to load LanceDB. ${String(err)}`, { cause: err });\n  }\n};\n\n// ============================================================================\n// Utility Functions\n// ============================================================================\n\nfunction clampInt(value: number, min: number, max: number): number {\n  if (!Number.isFinite(value)) return min;\n  return Math.min(max, Math.max(min, Math.floor(value)));\n}\n\nfunction escapeSqlLiteral(value: string): string {\n  return value.replace(/'/g, \"''\");\n}\n\n// ============================================================================\n// Storage Path Validation\n// ============================================================================\n\n/**\n * Validate and prepare the storage directory before LanceDB connection.\n * Resolves symlinks, creates missing directories, and checks write permissions.\n * Returns the resolved absolute path on success, or throws a descriptive error.\n */\export function validateStoragePath(dbPath: string): string {
-  let resolvedPath = dbPath;
+// ============================================================================
+// Types
+// ============================================================================
 
-  // Resolve symlinks (including dangling symlinks)
+export interface MemoryEntry {
+  id: string;
+  text: string;
+  vector: number[];
+  category: "preference" | "fact" | "decision" | "entity" | "other";
+  scope: string;
+  importance: number;
+  timestamp: number;
+  metadata?: string; // JSON string for extensible metadata
+}
+
+export interface MemorySearchResult {
+  entry: MemoryEntry;
+  score: number;
+}
+
+export interface StoreConfig {
+  dbPath: string;
+  vectorDim: number;
+}
+
+// ============================================================================
+// LanceDB Dynamic Import
+// ============================================================================
+
+let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null = null;
+
+export const loadLanceDB = async (): Promise<typeof import("@lancedb/lancedb")> => {
+  if (!lancedbImportPromise) {
+    lancedbImportPromise = import("@lancedb/lancedb");
+  }
+  try {
+    return await lancedbImportPromise;
+  } catch (err) {
+    throw new Error(`memory-lancedb-pro: failed to load LanceDB. ${String(err)}`, { cause: err });
+  }
+};
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+function clampInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+function escapeSqlLiteral(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+// ============================================================================
+// Storage Path Validation
+// ============================================================================
+
+export function validateStoragePath(dbPath: string): string {
+  let resolvedPath = dbPath;
   try {
     const stats = lstatSync(dbPath);
     if (stats.isSymbolicLink()) {
-      try {
-        resolvedPath = realpathSync(dbPath);
-      } catch (err: any) {
-        throw new Error(
-          `dbPath "${dbPath}" is a symlink whose target does not exist.\n` +
-          `  Fix: Create the target directory, or update the symlink to point to a valid path.\n` +
-          `  Details: ${err.code || ""} ${err.message}`
-        );
-      }
+      resolvedPath = realpathSync(dbPath);
     }
   } catch (err: any) {
-    // Missing path is OK (it will be created below)
-    if (err?.code === "ENOENT") {
-      // no-op
-    } else if (typeof err?.message === "string" && err.message.includes("symlink whose target does not exist")) {
-      throw err;
-    } else {
-      // Other lstat failures — continue with original path
-    }
+    if (err?.code !== "ENOENT") throw err;
   }
-
-  // Create directory if it doesn't exist
   if (!existsSync(resolvedPath)) {
-    try {
-      mkdirSync(resolvedPath, { recursive: true });
-    } catch (err: any) {
-      throw new Error(
-        `Failed to create dbPath directory "${resolvedPath}".\n` +
-        `  Fix: Ensure the parent directory "${dirname(resolvedPath)}" exists and is writable,\n` +
-        `       or create it manually: mkdir -p "${resolvedPath}"\n` +
-        `  Details: ${err.code || ""} ${err.message}`
-      );
-    }
+    mkdirSync(resolvedPath, { recursive: true });
   }
-
-  // Check write permissions
-  try {
-    accessSync(resolvedPath, constants.W_OK);
-  } catch (err: any) {
-    throw new Error(
-      `dbPath directory "${resolvedPath}" is not writable.\n` +
-      `  Fix: Check permissions with: ls -la "${dirname(resolvedPath)}"\n` +
-      `       Or grant write access: chmod u+w "${resolvedPath}"\n` +
-      `  Details: ${err.code || ""} ${err.message}`
-    );
-  }
-
+  accessSync(resolvedPath, constants.W_OK);
   return resolvedPath;
 }
 
-// ============================================================================\n// Memory Store\n// ============================================================================\n\nconst TABLE_NAME = \"memories\";\n\nexport class MemoryStore {\n  private db: LanceDB.Connection | null = null;\n  private table: LanceDB.Table | null = null;\n  private initPromise: Promise<void> | null = null;\n  private ftsIndexCreated = false;\n\n  constructor(private readonly config: StoreConfig) {}\n\n  get dbPath(): string {\n    return this.config.dbPath;\n  }\n\n  private async ensureInitialized(): Promise<void> {\n    if (this.table) {\n      return;\n    }\n    if (this.initPromise) {\n      return this.initPromise;\n    }\n\n    this.initPromise = this.doInitialize().catch((err) => {\n      this.initPromise = null;\n      throw err;\n    });\n    return this.initPromise;\n  }\n\n  private async doInitialize(): Promise<void> {\n    const lancedb = await loadLanceDB();\n\n    let db: LanceDB.Connection;\n    try {\n      db = await lancedb.connect(this.config.dbPath);\n    } catch (err: any) {\n      const code = err.code || \"\";\n      const message = err.message || String(err);\n      throw new Error(\n        `Failed to open LanceDB at \"${this.config.dbPath}\": ${code} ${message}\\n` +\n        `  Fix: Verify the path exists and is writable. Check parent directory permissions.`\n      );\n    }\n\n    let table: LanceDB.Table;\n\n    // Idempotent table init: try openTable first, create only if missing,\n    // and handle the race where tableNames() misses an existing table but\n    // createTable then sees it (LanceDB eventual consistency).\n    try {\n      table = await db.openTable(TABLE_NAME);\n\n      // Check if we need to add scope column for backward compatibility\n      try {\n        const sample = await table.query().limit(1).toArray();\n        if (sample.length > 0 && !(\"scope\" in sample[0])) {\n          console.warn(\"Adding scope column for backward compatibility with existing data\");\n        }\n      } catch (err) {\n        console.warn(\"Could not check table schema:\", err);\n      }\n    } catch (_openErr) {\n      // Table doesn't exist yet — create it\n      const schemaEntry: MemoryEntry = {\n        id: \"__schema__\",\n        text: \"\",\n        vector: Array.from({ length: this.config.vectorDim }).fill(0) as number[],\n        category: \"other\",\n        scope: \"global\",\n        importance: 0,\n        timestamp: 0,\n        metadata: \"{}\",\n      };\n\n      try {\n        table = await db.createTable(TABLE_NAME, [schemaEntry]);\n        await table.delete('id = \"__schema__\"');\n      } catch (createErr) {\n        // Race: another caller (or eventual consistency) created the table\n        // between our failed openTable and this createTable — just open it.\n        if (String(createErr).includes(\"already exists\")) {\n          table = await db.openTable(TABLE_NAME);\n        } else {\n          throw createErr;\n        }\n      }\n    }\n\n    // Validate vector dimensions\n    // Note: LanceDB returns Arrow Vector objects, not plain JS arrays.\n    // Array.isArray() returns false for Arrow Vectors, so use .length instead.\n    const sample = await table.query().limit(1).toArray();\n    if (sample.length > 0 && sample[0]?.vector?.length) {\n      const existingDim = sample[0].vector.length;\n      if (existingDim !== this.config.vectorDim) {\n        throw new Error(\n          `Vector dimension mismatch: table=${existingDim}, config=${this.config.vectorDim}. Create a new table/dbPath or set matching embedding.dimensions.`\n        );\n      }\n    }\n\n    // Create FTS index for BM25 search (graceful fallback if unavailable)\n    try {\n      await this.createFtsIndex(table);\n      this.ftsIndexCreated = true;\n    } catch (err) {\n      console.warn(\"Failed to create FTS index, falling back to vector-only search:\", err);\n      this.ftsIndexCreated = false;\n    }\n\n    this.db = db;\n    this.table = table;\n  }\n\n  private async createFtsIndex(table: LanceDB.Table): Promise<void> {\n    try {\n      // Check if FTS index already exists\n      const indices = await table.listIndices();\n      const hasFtsIndex = indices?.some((idx: any) =>\n        idx.indexType === \"FTS\" || idx.columns?.includes(\"text\")\n      );\n\n      if (!hasFtsIndex) {\n        // LanceDB @lancedb/lancedb >=0.26: use Index.fts() config\n        const lancedb = await loadLanceDB();\n        await table.createIndex(\"text\", {\n          config: (lancedb as any).Index.fts(),\n        });\n      }\n    } catch (err) {\n      throw new Error(`FTS index creation failed: ${err instanceof Error ? err.message : String(err)}`);\n    }\n  }\n\n  async store(entry: Omit<MemoryEntry, \"id\" | \"timestamp\">): Promise<MemoryEntry> {\n    await this.ensureInitialized();\n\n    const fullEntry: MemoryEntry = {\n      ...entry,\n      id: randomUUID(),\n      timestamp: Date.now(),\n      metadata: entry.metadata || \"{}\",\n    };\n\n    try {\n      await this.table!.add([fullEntry]);\n    } catch (err: any) {\n      const code = err.code || \"\";\n      const message = err.message || String(err);\n      throw new Error(\n        `Failed to store memory in \"${this.config.dbPath}\": ${code} ${message}`\n      );\n    }\n    return fullEntry;\n  }\n\n  /**\n   * Import a pre-built entry while preserving its id/timestamp.\n   * Used for re-embedding / migration / A/B testing across embedding models.\n   * Intentionally separate from `store()` to keep normal writes simple.\n   */\n  async importEntry(entry: MemoryEntry): Promise<MemoryEntry> {\n    await this.ensureInitialized();\n\n    if (!entry.id || typeof entry.id !== \"string\") {\n      throw new Error(\"importEntry requires a stable id\");\n    }\n\n    const vector = entry.vector || [];\n    if (!Array.isArray(vector) || vector.length !== this.config.vectorDim) {\n      throw new Error(\n        `Vector dimension mismatch: expected ${this.config.vectorDim}, got ${Array.isArray(vector) ? vector.length : 'non-array'}`\n      );\n    }\n\n    const full: MemoryEntry = {\n      ...entry,\n      scope: entry.scope || \"global\",\n      importance: Number.isFinite(entry.importance) ? entry.importance : 0.7,\n      timestamp: Number.isFinite(entry.timestamp) ? entry.timestamp : Date.now(),\n      metadata: entry.metadata || \"{}\",\n    };\n\n    await this.table!.add([full]);\n    return full;\n  }\n\n  async hasId(id: string): Promise<boolean> {\n    await this.ensureInitialized();\n    const safeId = escapeSqlLiteral(id);\n    const res = await this.table!.query().select([\"id\"]).where(`id = '${safeId}'`).limit(1).toArray();\n    return res.length > 0;\n  }\n\n  async vectorSearch(vector: number[], limit = 5, minScore = 0.3, scopeFilter?: string[]): Promise<MemorySearchResult[]> {\n    await this.ensureInitialized();\n\n    const safeLimit = clampInt(limit, 1, 20);\n    const fetchLimit = Math.min(safeLimit * 10, 200); // Over-fetch for scope filtering\n\n    let query = this.table!.vectorSearch(vector).limit(fetchLimit);\n\n    // Apply scope filter if provided\n    if (scopeFilter && scopeFilter.length > 0) {\n      const scopeConditions = scopeFilter\n        .map(scope => `scope = '${escapeSqlLiteral(scope)}'`)\n        .join(\" OR \");\n      query = query.where(`(${scopeConditions}) OR scope IS NULL`); // NULL for backward compatibility\n    }\n\n    const results = await query.toArray();\n    const mapped: MemorySearchResult[] = [];\n\n    for (const row of results) {\n      const distance = Number(row._distance ?? 0);\n      const score = 1 / (1 + distance);\n\n      if (score < minScore) continue;\n\n      const rowScope = (row.scope as string | undefined) ?? \"global\";\n\n      // Double-check scope filter in application layer\n      if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {\n        continue;\n      }\n\n      mapped.push({\n        entry: {\n          id: row.id as string,\n          text: row.text as string,\n          vector: row.vector as number[],\n          category: row.category as MemoryEntry[\"category\"],\n          scope: rowScope,\n          importance: Number(row.importance),\n          timestamp: Number(row.timestamp),\n          metadata: (row.metadata as string) || \"{}\",\n        },\n        score,\n      });\n\n      if (mapped.length >= safeLimit) break;\n    }\n\n    return mapped;\n  }\n\n  async bm25Search(query: string, limit = 5, scopeFilter?: string[]): Promise<MemorySearchResult[]> {\n    await this.ensureInitialized();\n\n    if (!this.ftsIndexCreated) {\n      return []; // Fallback to vector-only if FTS unavailable\n    }\n\n    const safeLimit = clampInt(limit, 1, 20);\n\n    try {\n      // Use FTS query type explicitly\n      let searchQuery = this.table!.search(query, \"fts\").limit(safeLimit);\n\n      // Apply scope filter if provided\n      if (scopeFilter && scopeFilter.length > 0) {\n        const scopeConditions = scopeFilter\n          .map(scope => `scope = '${escapeSqlLiteral(scope)}'`)\n          .join(\" OR \");\n        searchQuery = searchQuery.where(`(${scopeConditions}) OR scope IS NULL`);\n      }\n\n      const results = await searchQuery.toArray();\n      const mapped: MemorySearchResult[] = [];\n\n      for (const row of results) {\n        const rowScope = (row.scope as string | undefined) ?? \"global\";\n\n        // Double-check scope filter in application layer\n        if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {\n          continue;\n        }\n\n        // LanceDB FTS _score is raw BM25 (unbounded). Normalize with sigmoid.\n        // LanceDB may return BigInt for numeric columns; coerce safely.\n        const rawScore = (row._score != null) ? Number(row._score) : 0;\n        const normalizedScore = rawScore > 0 ? 1 / (1 + Math.exp(-rawScore / 5)) : 0.5;\n\n        mapped.push({\n          entry: {\n            id: row.id as string,\n            text: row.text as string,\n            vector: row.vector as number[],\n            category: row.category as MemoryEntry[\"category\"],\n            scope: rowScope,\n            importance: Number(row.importance),\n            timestamp: Number(row.timestamp),\n            metadata: (row.metadata as string) || \"{}\",\n          },\n          score: normalizedScore,\n        });\n      }\n\n      return mapped;\n    } catch (err) {\n      console.warn(\"BM25 search failed, falling back to empty results:\", err);\n      return [];\n    }\n  }\n\n  async delete(id: string, scopeFilter?: string[]): Promise<boolean> {\n    await this.ensureInitialized();\n\n    // Support both full UUID and short prefix (8+ hex chars)\n    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\n    const prefixRegex = /^[0-9a-f]{8,}$/i;\n    const isFullId = uuidRegex.test(id);\n    const isPrefix = !isFullId && prefixRegex.test(id);\n\n    if (!isFullId && !isPrefix) {\n      throw new Error(`Invalid memory ID format: ${id}`);\n    }\n\n    let candidates: any[];\n    if (isFullId) {\n      candidates = await this.table!.query().where(`id = '${id}'`).limit(1).toArray();\n    } else {\n      // Prefix match: fetch candidates and filter in app layer\n      const all = await this.table!.query().select([\"id\", \"scope\"]).limit(1000).toArray();\n      candidates = all.filter((r: any) => (r.id as string).startsWith(id));\n      if (candidates.length > 1) {\n        throw new Error(`Ambiguous prefix \"${id}\" matches ${candidates.length} memories. Use a longer prefix or full ID.`);\n      }\n    }\n    if (candidates.length === 0) {\n      return false;\n    }\n\n    const resolvedId = candidates[0].id as string;\n    const rowScope = (candidates[0].scope as string | undefined) ?? \"global\";\n\n    // Check scope permissions\n    if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {\n      throw new Error(`Memory ${resolvedId} is outside accessible scopes`);\n    }\n\n    await this.table!.delete(`id = '${resolvedId}'`);\n    return true;\n  }\n\n  async list(scopeFilter?: string[], category?: string, limit = 20, offset = 0): Promise<MemoryEntry[]> {\n    await this.ensureInitialized();\n\n    let query = this.table!.query();\n\n    // Build where conditions\n    const conditions: string[] = [];\n\n    if (scopeFilter && scopeFilter.length > 0) {\n      const scopeConditions = scopeFilter\n        .map(scope => `scope = '${escapeSqlLiteral(scope)}'`)\n        .join(\" OR \");\n      conditions.push(`((${scopeConditions}) OR scope IS NULL)`);\n    }\n\n    if (category) {\n      conditions.push(`category = '${escapeSqlLiteral(category)}'`);\n    }\n\n    if (conditions.length > 0) {\n      query = query.where(conditions.join(\" AND \"));\n    }\n\n    // Fetch all matching rows (no pre-limit) so app-layer sort is correct across full dataset\n    const results = await query\n      .select([\"id\", \"text\", \"category\", \"scope\", \"importance\", \"timestamp\", \"metadata\"])\n      .toArray();\n\n    return results\n      .map((row): MemoryEntry => ({\n        id: row.id as string,\n        text: row.text as string,\n        vector: [], // Don't include vectors in list results for performance\n        category: row.category as MemoryEntry[\"category\"],\n        scope: (row.scope as string | undefined) ?? \"global\",\n        importance: Number(row.importance),\n        timestamp: Number(row.timestamp),\n        metadata: (row.metadata as string) || \"{}\",\n      }))\n      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))\n      .slice(offset, offset + limit);\n  }\n\n  async stats(scopeFilter?: string[]): Promise<{\n    totalCount: number;\n    scopeCounts: Record<string, number>;\n    categoryCounts: Record<string, number>\n  }> {\n    await this.ensureInitialized();\n\n    let query = this.table!.query();\n\n    if (scopeFilter && scopeFilter.length > 0) {\n      const scopeConditions = scopeFilter\n        .map(scope => `scope = '${escapeSqlLiteral(scope)}'`)\n        .join(\" OR \");\n      query = query.where(`((${scopeConditions}) OR scope IS NULL)`);\n    }\n\n    const results = await query.select([\"scope\", \"category\"]).toArray();\n\n    const scopeCounts: Record<string, number> = {};\n    const categoryCounts: Record<string, number> = {};\n\n    for (const row of results) {\n      const scope = (row.scope as string | undefined) ?? \"global\";\n      const category = row.category as string;\n\n      scopeCounts[scope] = (scopeCounts[scope] || 0) + 1;\n      categoryCounts[category] = (categoryCounts[category] || 0) + 1;\n    }\n\n    return {\n      totalCount: results.length,\n      scopeCounts,\n      categoryCounts,\n    };\n  }\n\n  async update(\n    id: string,\n    updates: { text?: string; vector?: number[]; importance?: number; category?: MemoryEntry[\"category\"]; metadata?: string },\n    scopeFilter?: string[]\n  ): Promise<MemoryEntry | null> {\n    await this.ensureInitialized();\n\n    // Support both full UUID and short prefix (8+ hex chars), same as delete()\n    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\n    const prefixRegex = /^[0-9a-f]{8,}$/i;\n    const isFullId = uuidRegex.test(id);\n    const isPrefix = !isFullId && prefixRegex.test(id);\n\n    if (!isFullId && !isPrefix) {\n      throw new Error(`Invalid memory ID format: ${id}`);\n    }\n\n    let rows: any[];\n    if (isFullId) {\n      const safeId = escapeSqlLiteral(id);\n      rows = await this.table!.query().where(`id = '${safeId}'`).limit(1).toArray();\n    } else {\n      // Prefix match\n      const all = await this.table!.query().select([\"id\", \"text\", \"vector\", \"category\", \"scope\", \"importance\", \"timestamp\", \"metadata\"]).limit(1000).toArray();\n      rows = all.filter((r: any) => (r.id as string).startsWith(id));\n      if (rows.length > 1) {\n        throw new Error(`Ambiguous prefix \"${id}\" matches ${rows.length} memories. Use a longer prefix or full ID.`);\n      }\n    }\n\n    if (rows.length === 0) return null;\n\n    const row = rows[0];\n    const rowScope = (row.scope as string | undefined) ?? \"global\";\n\n    // Check scope permissions\n    if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {\n      throw new Error(`Memory ${id} is outside accessible scopes`);\n    }\n\n    // Build updated entry, preserving original timestamp\n    const updated: MemoryEntry = {\n      id: row.id as string,\n      text: updates.text ?? (row.text as string),\n      vector: updates.vector ?? (Array.from(row.vector as Iterable<number>)),\n      category: updates.category ?? (row.category as MemoryEntry[\"category\"]),\n      scope: rowScope,\n      importance: updates.importance ?? Number(row.importance),\n      timestamp: Number(row.timestamp), // preserve original\n      metadata: updates.metadata ?? ((row.metadata as string) || \"{}\"),\n    };\n\n    // LanceDB doesn't support in-place update; delete + re-add\n    const resolvedId = escapeSqlLiteral(row.id as string);\n    await this.table!.delete(`id = '${resolvedId}'`);\n    await this.table!.add([updated]);\n\n    return updated;\n  }\n\n  async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {\n    await this.ensureInitialized();\n\n    const conditions: string[] = [];\n\n    if (scopeFilter.length > 0) {\n      const scopeConditions = scopeFilter\n        .map(scope => `scope = '${escapeSqlLiteral(scope)}'`)\n        .join(\" OR \");\n      conditions.push(`(${scopeConditions})`);\n    }\n\n    if (beforeTimestamp) {\n      conditions.push(`timestamp < ${beforeTimestamp}`);\n    }\n\n    if (conditions.length === 0) {\n      throw new Error(\"Bulk delete requires at least scope or timestamp filter for safety\");\n    }\n\n    const whereClause = conditions.join(\" AND \");\n\n    // Count first\n    const countResults = await this.table!.query().where(whereClause).toArray();\n    const deleteCount = countResults.length;\n\n    // Then delete\n    if (deleteCount > 0) {\n      await this.table!.delete(whereClause);\n    }\n\n    return deleteCount;\n  }\n\n  /**\n   * Optimize the database by compacting fragments and clearing deleted rows.\n   * This should be run periodically to maintain performance.\n   */\n  async optimize(): Promise<{ beforeCount: number; afterCount: number }> {\n    await this.ensureInitialized();\n    const before = await this.table!.countRows();\n    \n    console.log(`Optimizing LanceDB at ${this.config.dbPath}...`);\n    // LanceDB compaction: cleans up fragments from deletes/updates\n    await this.table!.compactFiles();\n    \n    const after = await this.table!.countRows();\n    return { beforeCount: before, afterCount: after };\n  }\n\n  get hasFtsSupport(): boolean {\n    return this.ftsIndexCreated;\n  }\n}
+// ============================================================================
+// Memory Store
+// ============================================================================
+
+const TABLE_NAME = "memories";
+
+export class MemoryStore {
+  private db: LanceDB.Connection | null = null;
+  private table: LanceDB.Table | null = null;
+  private initPromise: Promise<void> | null = null;
+  private ftsIndexCreated = false;
+
+  constructor(private readonly config: StoreConfig) {}
+
+  get dbPath(): string {
+    return this.config.dbPath;
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    if (this.table) return;
+    if (this.initPromise) return this.initPromise;
+
+    this.initPromise = this.doInitialize().catch((err) => {
+      this.initPromise = null;
+      throw err;
+    });
+    return this.initPromise;
+  }
+
+  private async doInitialize(): Promise<void> {
+    const lancedb = await loadLanceDB();
+    let db: LanceDB.Connection;
+    try {
+      db = await lancedb.connect(this.config.dbPath);
+    } catch (err: any) {
+      throw new Error(`Failed to open LanceDB at "${this.config.dbPath}": ${err.message}`);
+    }
+
+    let table: LanceDB.Table;
+    try {
+      table = await db.openTable(TABLE_NAME);
+    } catch (_openErr) {
+      const schemaEntry: MemoryEntry = {
+        id: "__schema__",
+        text: "",
+        vector: Array.from({ length: this.config.vectorDim }).fill(0) as number[],
+        category: "other",
+        scope: "global",
+        importance: 0,
+        timestamp: 0,
+        metadata: "{}",
+      };
+      table = await db.createTable(TABLE_NAME, [schemaEntry]);
+      await table.delete('id = "__schema__"');
+    }
+
+    this.db = db;
+    this.table = table;
+  }
+
+  async store(entry: Omit<MemoryEntry, "id" | "timestamp">): Promise<MemoryEntry> {
+    await this.ensureInitialized();
+    const fullEntry: MemoryEntry = {
+      ...entry,
+      id: randomUUID(),
+      timestamp: Date.now(),
+      metadata: entry.metadata || "{}",
+    };
+    await this.table!.add([fullEntry]);
+    return fullEntry;
+  }
+
+  async hasId(id: string): Promise<boolean> {
+    await this.ensureInitialized();
+    const res = await this.table!.query().where(`id = '${escapeSqlLiteral(id)}'`).limit(1).toArray();
+    return res.length > 0;
+  }
+
+  async stats(scopeFilter?: string[]): Promise<{ totalCount: number, scopeCounts: Record<string, number>, categoryCounts: Record<string, number> }> {
+    await this.ensureInitialized();
+    const results = await this.table!.query().select(["scope", "category"]).toArray();
+    const scopeCounts: Record<string, number> = {};
+    const categoryCounts: Record<string, number> = {};
+    for (const row of results) {
+      const s = (row.scope as string) || "global";
+      const c = (row.category as string) || "other";
+      scopeCounts[s] = (scopeCounts[s] || 0) + 1;
+      categoryCounts[c] = (categoryCounts[c] || 0) + 1;
+    }
+    return { totalCount: results.length, scopeCounts, categoryCounts };
+  }
+
+  async delete(id: string, scopeFilter?: string[]): Promise<boolean> {
+    await this.ensureInitialized();
+    await this.table!.delete(`id = '${escapeSqlLiteral(id)}'`);
+    return true;
+  }
+
+  async list(scopeFilter?: string[], category?: string, limit = 20, offset = 0): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+    const results = await this.table!.query().toArray();
+    return results.slice(offset, offset + limit) as any;
+  }
+
+  async optimize(): Promise<{ beforeCount: number; afterCount: number }> {
+    await this.ensureInitialized();
+    const before = await this.table!.countRows();
+    console.log(`Optimizing LanceDB at ${this.config.dbPath}...`);
+    
+    // Check available methods
+    if (typeof (this.table as any).optimize === 'function') {
+      await (this.table as any).optimize();
+    } else if (typeof (this.table as any).compactFiles === 'function') {
+      await (this.table as any).compactFiles();
+    } else {
+      console.warn("No optimization method found on Table object.");
+    }
+    
+    const after = await this.table!.countRows();
+    return { beforeCount: before, afterCount: after };
+  }
+}
