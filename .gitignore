@@ -1,1 +1,16 @@
 node_modules/
+
+# Local databases / personal data
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+*.arrow
+
+# Env / secrets
+.env
+.env.*
+
+# Local memory backups (if created)
+memory/
+backups/
