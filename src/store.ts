@@ -101,6 +101,13 @@ export class MemoryStore {
     return this.config.dbPath;
   }
 
+  // LanceDB JS FTS support is environment/version dependent.
+  // We expose a conservative flag to prevent hybrid retrieval from
+  // calling unimplemented/unsupported BM25 paths.
+  get hasFtsSupport(): boolean {
+    return false;
+  }
+
   private async ensureInitialized(): Promise<void> {
     if (this.table) return;
     if (this.initPromise) return this.initPromise;
@@ -203,5 +210,86 @@ export class MemoryStore {
     
     const after = await this.table!.countRows();
     return { beforeCount: before, afterCount: after };
+  }
+
+  async vectorSearch(
+    queryVector: number[],
+    limit = 5,
+    minScore = 0,
+    scopeFilter?: string[]
+  ): Promise<MemorySearchResult[]> {
+    await this.ensureInitialized();
+
+    const safeLimit = clampInt(limit, 1, 100);
+    const table: any = this.table as any;
+    if (!table || typeof table.search !== "function") {
+      throw new Error("memory-lancedb-pro: LanceDB table.search() not available");
+    }
+
+    let query: any = table.search(queryVector);
+    if (typeof query.limit === "function") {
+      query = query.limit(safeLimit);
+    }
+
+    // Try pushdown filtering when supported; otherwise filter in JS after fetch.
+    let needsPostFilter = false;
+    if (scopeFilter && scopeFilter.length > 0) {
+      if (typeof query.where === "function") {
+        const cond = scopeFilter
+          .map((s) => `scope = '${escapeSqlLiteral(s)}'`)
+          .join(" OR ");
+        query = query.where(cond);
+      } else {
+        needsPostFilter = true;
+      }
+    }
+
+    const rows = (await query.toArray()) as any[];
+    const filteredRows = needsPostFilter && scopeFilter && scopeFilter.length > 0
+      ? rows.filter((r) => scopeFilter.includes(String(r?.scope || "global")))
+      : rows;
+
+    const results: MemorySearchResult[] = [];
+    for (const row of filteredRows) {
+      const entry: MemoryEntry = {
+        id: String(row?.id ?? ""),
+        text: String(row?.text ?? ""),
+        vector: Array.isArray(row?.vector)
+          ? row.vector
+          : Array.from((row?.vector ?? []) as Iterable<number>),
+        category: (row?.category as any) || "other",
+        scope: String(row?.scope ?? "global"),
+        importance: Number.isFinite(row?.importance) ? Number(row.importance) : 0,
+        timestamp: Number.isFinite(row?.timestamp) ? Number(row.timestamp) : 0,
+        metadata: typeof row?.metadata === "string" ? row.metadata : JSON.stringify(row?.metadata ?? {}),
+      };
+
+      let score = 0;
+      if (typeof row?.score === "number") {
+        score = row.score;
+      } else if (typeof row?._score === "number") {
+        score = row._score;
+      } else if (typeof row?._distance === "number") {
+        score = 1 / (1 + row._distance);
+      } else if (typeof row?.distance === "number") {
+        score = 1 / (1 + row.distance);
+      }
+
+      if (score >= minScore) {
+        results.push({ entry, score });
+      }
+    }
+
+    return results.slice(0, safeLimit);
+  }
+
+  async bm25Search(
+    _query: string,
+    _limit = 5,
+    _scopeFilter?: string[]
+  ): Promise<MemorySearchResult[]> {
+    // FTS/BM25 not supported in this build; keep API surface for callers.
+    // When hasFtsSupport becomes true, implement a proper FTS index path.
+    return [];
   }
 }
